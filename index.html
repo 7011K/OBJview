@@ -2,184 +2,205 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<title>OBJパーツ分割 WebGL Viewer</title>
+<title>OBJ→HTML 変換ツール</title>
 <style>
-body { margin:0; overflow:hidden; }
-canvas { width:100vw; height:100vh; display:block; }
-#fileInput { position:fixed; top:10px; left:10px; z-index:10; }
-#controls { position:fixed; top:10px; left:120px; z-index:10; background:rgba(255,255,255,0.8); padding:5px; border-radius:5px;}
+body { font-family: sans-serif; margin:30px; }
+input[type=file] { margin:10px; }
+#output { margin-top:20px; }
 </style>
 </head>
 <body>
-<input type="file" id="fileInput" accept=".obj">
-<div id="controls"></div>
-<canvas id="glcanvas"></canvas>
+<h2>OBJ→HTML変換ツール</h2>
+<p>OBJ, MTL, テクスチャ画像を選択して「表示用HTML生成」ボタンを押してください。</p>
+OBJファイル: <input type="file" id="objFile" accept=".obj"><br>
+MTLファイル: <input type="file" id="mtlFile" accept=".mtl"><br>
+テクスチャ画像: <input type="file" id="imgFile" multiple accept="image/*"><br>
+<button id="generateBtn">表示用HTML生成＆ダウンロード</button>
+<div id="output"></div>
 <script>
-let parts = []; // [{name, vertices, faces, visible}]
-let allVertices = [];
-let gl, canvas, program, uMVP, aPosition;
-let vertexBuffers = [], indexBuffers = [];
+// Three.js CDN（必要ならローカル保存版に変更可能）
+const THREEJS_URL = "https://cdn.jsdelivr.net/npm/three@0.154.0/build/three.min.js";
+const OBJLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.154.0/examples/js/loaders/OBJLoader.js";
+const MTLLOADER_URL = "https://cdn.jsdelivr.net/npm/three@0.154.0/examples/js/loaders/MTLLoader.js";
 
-document.getElementById('fileInput').addEventListener('change', function(e) {
-    if (e.target.files.length === 0) return;
-    const file = e.target.files[0];
-    const reader = new FileReader();
-    reader.onload = function(ev) {
-        parseOBJParts(ev.target.result);
-        setupWebGL();
-        setupControls();
-        draw();
-    };
-    reader.readAsText(file);
-});
+// ファイル読込
+function readFile(file, as='text') {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => resolve(reader.result);
+        reader.onerror = reject;
+        as==='text' ? reader.readAsText(file) : reader.readAsDataURL(file);
+    });
+}
 
-// OBJパーサ（gパーツ分割対応）
-function parseOBJParts(objText) {
-    parts = [];
-    allVertices = [];
-    let curPart = null;
-    let vOffset = 0;
-    let lines = objText.split('\n');
-    for (let line of lines) {
-        line = line.trim();
-        if (line.startsWith('g ')) {
-            let name = line.substring(2).trim() || 'Unnamed';
-            curPart = {name, vertices: [], faces: [], visible: true, color: [Math.random(),Math.random(),Math.random()]};
-            parts.push(curPart);
-            vOffset = allVertices.length;
-        } else if (line.startsWith('v ')) {
-            const [, x, y, z] = line.split(/\s+/);
-            allVertices.push([parseFloat(x), parseFloat(y), parseFloat(z)]);
-            if (curPart) curPart.vertices.push([parseFloat(x), parseFloat(y), parseFloat(z)]);
-        } else if (line.startsWith('f ')) {
-            const partsRaw = line.split(/\s+/).slice(1);
-            const face = partsRaw.map(p => parseInt(p.split('/')[0],10) - vOffset - 1);
-            // 三角形化
-            if (face.length == 3 && curPart) curPart.faces.push(face);
-            else if (face.length == 4 && curPart) {
-                curPart.faces.push([face[0], face[1], face[2]]);
-                curPart.faces.push([face[0], face[2], face[3]]);
-            }
+document.getElementById('generateBtn').onclick = async function() {
+    const objFile = document.getElementById('objFile').files[0];
+    const mtlFile = document.getElementById('mtlFile').files[0];
+    const imgFiles = Array.from(document.getElementById('imgFile').files);
+
+    if (!objFile) { alert('OBJファイルを選択してください'); return; }
+
+    // ファイル読込
+    const objText = await readFile(objFile, 'text');
+    let mtlText = '';
+    if (mtlFile) mtlText = await readFile(mtlFile, 'text');
+
+    // 画像は base64 に
+    const imgMap = {};
+    for (const img of imgFiles) {
+        const dataUrl = await readFile(img, 'data');
+        imgMap[img.name] = dataUrl;
+    }
+
+    // HTML生成
+    const html = makeModelHtml(objText, mtlText, imgMap);
+    const blob = new Blob([html], {type:'text/html'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'model_viewer.html';
+    a.textContent = 'ダウンロード: model_viewer.html';
+    document.getElementById('output').innerHTML = '';
+    document.getElementById('output').appendChild(a);
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(url),10000);
+};
+
+// HTML生成ロジック
+function makeModelHtml(objText, mtlText, imgMap) {
+    // テクスチャ画像をbase64で置き換える
+    // MTL内の「map_Kd テクスチャ名」をbase64に
+    let mtlTextEmbed = mtlText;
+    for (const fname in imgMap) {
+        // map_Kd .../fname
+        mtlTextEmbed = mtlTextEmbed.replace(
+            new RegExp(`map_Kd\\s+.*${fname}`,'g'),
+            `map_Kd ${imgMap[fname]}`
+        );
+    }
+
+    // OBJ/MTLをbase64で埋め込み
+    const objBase64 = btoa(unescape(encodeURIComponent(objText)));
+    const mtlBase64 = mtlText ? btoa(unescape(encodeURIComponent(mtlTextEmbed))) : '';
+
+    return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>OBJモデル表示ビューア（Three.js）</title>
+<style>body{margin:0;overflow:hidden;}canvas{width:100vw;height:100vh;display:block;}</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div style="position:fixed;top:10px;left:10px;z-index:10;background:rgba(255,255,255,0.8);padding:8px;border-radius:8px;">
+    <span id="tree"></span>
+</div>
+<script src="${THREEJS_URL}"></script>
+<script src="${MTLLOADER_URL}"></script>
+<script src="${OBJLOADER_URL}"></script>
+<script>
+// OBJ/MTL base64データ
+const objData = decodeURIComponent(escape(atob("${objBase64}")));
+${mtlText ? 'const mtlData = decodeURIComponent(escape(atob("' + mtlBase64 + '")));' : ''}
+
+// DataLoader: テキストをThree.js Loaderに渡すための仮想ファイル
+class TextLoader {
+    constructor(text) { this.text = text; }
+    load(url, onLoad) { onLoad(this.text); }
+}
+
+function createScene() {
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 1000);
+    camera.position.set(0,2,6);
+
+    const renderer = new THREE.WebGLRenderer({canvas:document.getElementById('canvas'),antialias:true});
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    // 環境光 & ライト
+    scene.add(new THREE.AmbientLight(0xffffff,0.6));
+    const dirLight = new THREE.DirectionalLight(0xffffff,0.8);
+    dirLight.position.set(5,10,10);
+    scene.add(dirLight);
+
+    // コントロール
+    let controls;
+    try {
+        // OrbitControls が利用できる場合（CDNなどで追加）
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+    } catch(e) {
+        // なくても表示は可能
+    }
+
+    // OBJ/MTLローダー
+    function loadOBJMTL() {
+        // テクスチャ画像のbase64は MTL内で map_Kd data:image... になっているので Three.js が自動読込
+        if (${mtlText ? 'true' : 'false'}) {
+            const mtlLoader = new THREE.MTLLoader();
+            mtlLoader.load = (url, onLoad) => onLoad(mtlData); // 差し替え
+            mtlLoader.load('', materials => {
+                materials.preload();
+                const objLoader = new THREE.OBJLoader();
+                objLoader.setMaterials(materials);
+                objLoader.load = (url, onLoad) => onLoad(objData);
+                objLoader.load('', obj => {
+                    scene.add(obj);
+                    setupTree(obj);
+                });
+            });
+        } else {
+            const objLoader = new THREE.OBJLoader();
+            objLoader.load = (url, onLoad) => onLoad(objData);
+            objLoader.load('', obj => {
+                scene.add(obj);
+                setupTree(obj);
+            });
         }
     }
-    // パーツがなかった場合は全部1つに
-    if (parts.length === 0) {
-        parts.push({name:"全体", vertices: allVertices, faces:[], visible:true, color:[0.2,0.6,0.9]});
-        let vOffset = 0;
-        for (let line of lines) {
-            if (line.startsWith('f ')) {
-                const partsRaw = line.split(/\s+/).slice(1);
-                const face = partsRaw.map(p => parseInt(p.split('/')[0],10) - vOffset - 1);
-                if (face.length == 3) parts[0].faces.push(face);
-                else if (face.length == 4) {
-                    parts[0].faces.push([face[0], face[1], face[2]]);
-                    parts[0].faces.push([face[0], face[2], face[3]]);
+
+    loadOBJMTL();
+
+    // 再描画
+    function animate() {
+        requestAnimationFrame(animate);
+        renderer.render(scene, camera);
+        if (controls) controls.update();
+    }
+    animate();
+
+    // 階層構造ツリーUI
+    function setupTree(objRoot) {
+        const treeDiv = document.getElementById('tree');
+        function buildTree(obj, depth=0) {
+            const div = document.createElement('div');
+            div.style.marginLeft = (depth*14) + "px";
+            // パーツ名
+            let name = obj.name || obj.type;
+            if (!name) name = '[Mesh]';
+            // 表示/非表示
+            const chk = document.createElement('input');
+            chk.type = 'checkbox';
+            chk.checked = obj.visible;
+            chk.onchange = ()=>{ obj.visible = chk.checked; };
+            div.appendChild(chk);
+            div.appendChild(document.createTextNode(' ' + name));
+            treeDiv.appendChild(div);
+            // 再帰
+            if (obj.children) {
+                for (const child of obj.children) {
+                    buildTree(child, depth+1);
                 }
             }
         }
+        treeDiv.innerHTML = '';
+        buildTree(objRoot, 0);
     }
 }
-
-function setupControls() {
-    const controls = document.getElementById('controls');
-    controls.innerHTML = '';
-    parts.forEach((part, idx) => {
-        const chk = document.createElement('input');
-        chk.type = 'checkbox';
-        chk.checked = part.visible;
-        chk.id = 'partchk'+idx;
-        chk.onchange = function() {
-            part.visible = this.checked;
-            draw();
-        };
-        const lbl = document.createElement('label');
-        lbl.htmlFor = chk.id;
-        lbl.appendChild(document.createTextNode(part.name));
-        lbl.style.marginRight = "12px";
-        controls.appendChild(chk);
-        controls.appendChild(lbl);
-    });
-}
-
-function setupWebGL() {
-    canvas = document.getElementById('glcanvas');
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-    gl = canvas.getContext('webgl');
-    if (!gl) { alert('WebGL not supported'); return; }
-
-    // シェーダー
-    const vsSource = `
-        attribute vec3 aPosition;
-        uniform mat4 uMVP;
-        void main(void) { gl_Position = uMVP * vec4(aPosition, 1.0); }
-    `;
-    const fsSource = `
-        precision mediump float;
-        uniform vec3 uColor;
-        void main(void) { gl_FragColor = vec4(uColor, 1.0); }
-    `;
-    function compile(src, type) {
-        const shader = gl.createShader(type);
-        gl.shaderSource(shader, src);
-        gl.compileShader(shader);
-        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-            alert(gl.getShaderInfoLog(shader));
-            return null;
-        }
-        return shader;
-    }
-    const vs = compile(vsSource, gl.VERTEX_SHADER);
-    const fs = compile(fsSource, gl.FRAGMENT_SHADER);
-    program = gl.createProgram();
-    gl.attachShader(program, vs);
-    gl.attachShader(program, fs);
-    gl.linkProgram(program);
-    gl.useProgram(program);
-    aPosition = gl.getAttribLocation(program, 'aPosition');
-    uMVP = gl.getUniformLocation(program, 'uMVP');
-    parts.forEach((part, idx) => {
-        // バッファ生成
-        vertexBuffers[idx] = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffers[idx]);
-        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(part.vertices.flat()), gl.STATIC_DRAW);
-        indexBuffers[idx] = gl.createBuffer();
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffers[idx]);
-        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(part.faces.flat()), gl.STATIC_DRAW);
-    });
-}
-
-function getMVP(angle) {
-    const rad = angle * Math.PI / 180.0;
-    const c = Math.cos(rad), s = Math.sin(rad);
-    return new Float32Array([
-        c, 0, s, 0,
-        0, 1, 0, 0,
-       -s, 0, c, 0,
-        0, 0, -3, 1
-    ]);
-}
-
-function draw() {
-    if (!gl) return;
-    const t = performance.now() / 1000;
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.clearColor(1, 1, 1, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.enable(gl.DEPTH_TEST);
-    gl.useProgram(program);
-    gl.uniformMatrix4fv(uMVP, false, getMVP(t*30));
-    parts.forEach((part, idx) => {
-        if (!part.visible || part.faces.length === 0) return;
-        gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffers[idx]);
-        gl.vertexAttribPointer(aPosition, 3, gl.FLOAT, false, 0, 0);
-        gl.enableVertexAttribArray(aPosition);
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffers[idx]);
-        let uColor = gl.getUniformLocation(program, 'uColor');
-        gl.uniform3fv(uColor, part.color);
-        gl.drawElements(gl.TRIANGLES, part.faces.length * 3, gl.UNSIGNED_SHORT, 0);
-    });
-    requestAnimationFrame(draw);
+createScene();
+</script>
+</body>
+</html>
+`;
 }
 </script>
 </body>
