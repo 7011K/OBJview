@@ -2,89 +2,122 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<title>OBJ to HTML Viewer Generator</title>
+<title>OBJパーツ分割 WebGL Viewer</title>
 <style>
 body { margin:0; overflow:hidden; }
 canvas { width:100vw; height:100vh; display:block; }
-#fileInput, #downloadBtn { position:fixed; top:10px; left:10px; z-index:10; }
-#downloadBtn { left:160px; }
+#fileInput { position:fixed; top:10px; left:10px; z-index:10; }
+#controls { position:fixed; top:10px; left:120px; z-index:10; background:rgba(255,255,255,0.8); padding:5px; border-radius:5px;}
 </style>
 </head>
 <body>
 <input type="file" id="fileInput" accept=".obj">
-<button id="downloadBtn" style="display:none;">HTMLでダウンロード</button>
+<div id="controls"></div>
 <canvas id="glcanvas"></canvas>
 <script>
-let vertices = [], faces = [];
+let parts = []; // [{name, vertices, faces, visible}]
+let allVertices = [];
+let gl, canvas, program, uMVP, aPosition;
+let vertexBuffers = [], indexBuffers = [];
 
-// OBJファイル読み込み
 document.getElementById('fileInput').addEventListener('change', function(e) {
     if (e.target.files.length === 0) return;
     const file = e.target.files[0];
     const reader = new FileReader();
     reader.onload = function(ev) {
-        parseOBJ(ev.target.result);
+        parseOBJParts(ev.target.result);
         setupWebGL();
+        setupControls();
         draw();
-        document.getElementById('downloadBtn').style.display = "inline";
     };
     reader.readAsText(file);
 });
 
-// 変換HTMLダウンロード
-document.getElementById('downloadBtn').addEventListener('click', function() {
-    const html = generateHTML(vertices, faces);
-    const blob = new Blob([html], {type: 'text/html'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'model_viewer.html';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-});
-
-function parseOBJ(objText) {
-    vertices = [];
-    faces = [];
-    objText.split('\n').forEach(line => {
+// OBJパーサ（gパーツ分割対応）
+function parseOBJParts(objText) {
+    parts = [];
+    allVertices = [];
+    let curPart = null;
+    let vOffset = 0;
+    let lines = objText.split('\n');
+    for (let line of lines) {
         line = line.trim();
-        if (line.startsWith('v ')) {
+        if (line.startsWith('g ')) {
+            let name = line.substring(2).trim() || 'Unnamed';
+            curPart = {name, vertices: [], faces: [], visible: true, color: [Math.random(),Math.random(),Math.random()]};
+            parts.push(curPart);
+            vOffset = allVertices.length;
+        } else if (line.startsWith('v ')) {
             const [, x, y, z] = line.split(/\s+/);
-            vertices.push([parseFloat(x), parseFloat(y), parseFloat(z)]);
+            allVertices.push([parseFloat(x), parseFloat(y), parseFloat(z)]);
+            if (curPart) curPart.vertices.push([parseFloat(x), parseFloat(y), parseFloat(z)]);
         } else if (line.startsWith('f ')) {
-            const parts = line.split(/\s+/).slice(1);
-            const face = parts.map(p => parseInt(p.split('/')[0],10) - 1);
-            if (face.length === 3) faces.push(face);
-            else if (face.length === 4) {
-                faces.push([face[0], face[1], face[2]]);
-                faces.push([face[0], face[2], face[3]]);
+            const partsRaw = line.split(/\s+/).slice(1);
+            const face = partsRaw.map(p => parseInt(p.split('/')[0],10) - vOffset - 1);
+            // 三角形化
+            if (face.length == 3 && curPart) curPart.faces.push(face);
+            else if (face.length == 4 && curPart) {
+                curPart.faces.push([face[0], face[1], face[2]]);
+                curPart.faces.push([face[0], face[2], face[3]]);
             }
         }
+    }
+    // パーツがなかった場合は全部1つに
+    if (parts.length === 0) {
+        parts.push({name:"全体", vertices: allVertices, faces:[], visible:true, color:[0.2,0.6,0.9]});
+        let vOffset = 0;
+        for (let line of lines) {
+            if (line.startsWith('f ')) {
+                const partsRaw = line.split(/\s+/).slice(1);
+                const face = partsRaw.map(p => parseInt(p.split('/')[0],10) - vOffset - 1);
+                if (face.length == 3) parts[0].faces.push(face);
+                else if (face.length == 4) {
+                    parts[0].faces.push([face[0], face[1], face[2]]);
+                    parts[0].faces.push([face[0], face[2], face[3]]);
+                }
+            }
+        }
+    }
+}
+
+function setupControls() {
+    const controls = document.getElementById('controls');
+    controls.innerHTML = '';
+    parts.forEach((part, idx) => {
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.checked = part.visible;
+        chk.id = 'partchk'+idx;
+        chk.onchange = function() {
+            part.visible = this.checked;
+            draw();
+        };
+        const lbl = document.createElement('label');
+        lbl.htmlFor = chk.id;
+        lbl.appendChild(document.createTextNode(part.name));
+        lbl.style.marginRight = "12px";
+        controls.appendChild(chk);
+        controls.appendChild(lbl);
     });
 }
 
 function setupWebGL() {
-    const canvas = document.getElementById('glcanvas');
+    canvas = document.getElementById('glcanvas');
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
-    const gl = canvas.getContext('webgl');
+    gl = canvas.getContext('webgl');
     if (!gl) { alert('WebGL not supported'); return; }
 
     // シェーダー
     const vsSource = `
         attribute vec3 aPosition;
         uniform mat4 uMVP;
-        void main(void) {
-            gl_Position = uMVP * vec4(aPosition, 1.0);
-        }
+        void main(void) { gl_Position = uMVP * vec4(aPosition, 1.0); }
     `;
     const fsSource = `
         precision mediump float;
-        void main(void) {
-            gl_FragColor = vec4(0.2, 0.6, 0.9, 1.0);
-        }
+        uniform vec3 uColor;
+        void main(void) { gl_FragColor = vec4(uColor, 1.0); }
     `;
     function compile(src, type) {
         const shader = gl.createShader(type);
@@ -98,142 +131,55 @@ function setupWebGL() {
     }
     const vs = compile(vsSource, gl.VERTEX_SHADER);
     const fs = compile(fsSource, gl.FRAGMENT_SHADER);
-    const program = gl.createProgram();
+    program = gl.createProgram();
     gl.attachShader(program, vs);
     gl.attachShader(program, fs);
     gl.linkProgram(program);
     gl.useProgram(program);
-
-    // 頂点バッファ
-    const vertexBuffer = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices.flat()), gl.STATIC_DRAW);
-
-    // インデックスバッファ
-    const indexBuffer = gl.createBuffer();
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(faces.flat()), gl.STATIC_DRAW);
-
-    // 属性
-    const aPosition = gl.getAttribLocation(program, 'aPosition');
-    gl.enableVertexAttribArray(aPosition);
-    gl.vertexAttribPointer(aPosition, 3, gl.FLOAT, false, 0, 0);
-
-    const uMVP = gl.getUniformLocation(program, 'uMVP');
-
-    function getMVP(angle) {
-        const rad = angle * Math.PI / 180.0;
-        const c = Math.cos(rad), s = Math.sin(rad);
-        // シンプルなY軸回転＋Z方向へ視点移動
-        return new Float32Array([
-            c, 0, s, 0,
-            0, 1, 0, 0,
-           -s, 0, c, 0,
-            0, 0, -3, 1
-        ]);
-    }
-
-    function draw() {
-        const t = performance.now() / 1000;
-        gl.viewport(0, 0, canvas.width, canvas.height);
-        gl.clearColor(1, 1, 1, 1);
-        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-        gl.enable(gl.DEPTH_TEST);
-        gl.uniformMatrix4fv(uMVP, false, getMVP(t*30));
-        gl.drawElements(gl.TRIANGLES, faces.length * 3, gl.UNSIGNED_SHORT, 0);
-        requestAnimationFrame(draw);
-    }
-    draw();
+    aPosition = gl.getAttribLocation(program, 'aPosition');
+    uMVP = gl.getUniformLocation(program, 'uMVP');
+    parts.forEach((part, idx) => {
+        // バッファ生成
+        vertexBuffers[idx] = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffers[idx]);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(part.vertices.flat()), gl.STATIC_DRAW);
+        indexBuffers[idx] = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffers[idx]);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(part.faces.flat()), gl.STATIC_DRAW);
+    });
 }
 
-// ダウンロード用HTML生成（埋め込み型）
-function generateHTML(vertices, faces) {
-    // 配列を文字列化（インデントなしで軽量化）
-    const vertStr = JSON.stringify(vertices);
-    const faceStr = JSON.stringify(faces);
-    return `<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="UTF-8">
-<title>OBJモデル（WebGL閲覧用）</title>
-<style>body{margin:0;overflow:hidden;}canvas{width:100vw;height:100vh;display:block;}</style>
-</head>
-<body>
-<canvas id="glcanvas"></canvas>
-<script>
-const vertices = ${vertStr};
-const faces = ${faceStr};
-(function(){
-    const canvas = document.getElementById('glcanvas');
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-    const gl = canvas.getContext('webgl');
-    if (!gl) { alert('WebGL not supported'); return; }
-    const vsSource = \`
-        attribute vec3 aPosition;
-        uniform mat4 uMVP;
-        void main(void) {
-            gl_Position = uMVP * vec4(aPosition, 1.0);
-        }
-    \`;
-    const fsSource = \`
-        precision mediump float;
-        void main(void) {
-            gl_FragColor = vec4(0.2, 0.6, 0.9, 1.0);
-        }
-    \`;
-    function compile(src, type) {
-        const shader = gl.createShader(type);
-        gl.shaderSource(shader, src);
-        gl.compileShader(shader);
-        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-            alert(gl.getShaderInfoLog(shader));
-            return null;
-        }
-        return shader;
-    }
-    const vs = compile(vsSource, gl.VERTEX_SHADER);
-    const fs = compile(fsSource, gl.FRAGMENT_SHADER);
-    const program = gl.createProgram();
-    gl.attachShader(program, vs);
-    gl.attachShader(program, fs);
-    gl.linkProgram(program);
+function getMVP(angle) {
+    const rad = angle * Math.PI / 180.0;
+    const c = Math.cos(rad), s = Math.sin(rad);
+    return new Float32Array([
+        c, 0, s, 0,
+        0, 1, 0, 0,
+       -s, 0, c, 0,
+        0, 0, -3, 1
+    ]);
+}
+
+function draw() {
+    if (!gl) return;
+    const t = performance.now() / 1000;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(1, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
     gl.useProgram(program);
-    const vertexBuffer = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices.flat()), gl.STATIC_DRAW);
-    const indexBuffer = gl.createBuffer();
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(faces.flat()), gl.STATIC_DRAW);
-    const aPosition = gl.getAttribLocation(program, 'aPosition');
-    gl.enableVertexAttribArray(aPosition);
-    gl.vertexAttribPointer(aPosition, 3, gl.FLOAT, false, 0, 0);
-    const uMVP = gl.getUniformLocation(program, 'uMVP');
-    function getMVP(angle) {
-        const rad = angle * Math.PI / 180.0;
-        const c = Math.cos(rad), s = Math.sin(rad);
-        return new Float32Array([
-            c, 0, s, 0,
-            0, 1, 0, 0,
-           -s, 0, c, 0,
-            0, 0, -3, 1
-        ]);
-    }
-    function draw() {
-        const t = performance.now() / 1000;
-        gl.viewport(0, 0, canvas.width, canvas.height);
-        gl.clearColor(1, 1, 1, 1);
-        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-        gl.enable(gl.DEPTH_TEST);
-        gl.uniformMatrix4fv(uMVP, false, getMVP(t*30));
-        gl.drawElements(gl.TRIANGLES, faces.length * 3, gl.UNSIGNED_SHORT, 0);
-        requestAnimationFrame(draw);
-    }
-    draw();
-})();
-</script>
-</body>
-</html>`;
+    gl.uniformMatrix4fv(uMVP, false, getMVP(t*30));
+    parts.forEach((part, idx) => {
+        if (!part.visible || part.faces.length === 0) return;
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffers[idx]);
+        gl.vertexAttribPointer(aPosition, 3, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(aPosition);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffers[idx]);
+        let uColor = gl.getUniformLocation(program, 'uColor');
+        gl.uniform3fv(uColor, part.color);
+        gl.drawElements(gl.TRIANGLES, part.faces.length * 3, gl.UNSIGNED_SHORT, 0);
+    });
+    requestAnimationFrame(draw);
 }
 </script>
 </body>
